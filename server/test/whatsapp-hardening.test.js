@@ -4,10 +4,12 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 
 import {
     selectSenderDigits,
     reconnectDelayMs,
+    findSystemChromium,
     __reconnectForTest
 } from '../services/whatsapp.service.js';
 
@@ -49,4 +51,32 @@ test('P1-E: reconnect backoff doubles from 5s and caps at 2min', () => {
 test('P1-E: reconnect counter helper resets', () => {
     __reconnectForTest.reset();
     assert.equal(__reconnectForTest.attempts, 0);
+});
+
+// --- findSystemChromium (npm-start Chrome fix) ----------------------------------
+test('WA-boot: resolver returns a real executable or empty string, never throws', () => {
+    const found = findSystemChromium();
+    assert.equal(typeof found, 'string');
+    if (found) {
+        // Must be a file the launcher can actually spawn — not a zip, dir, or
+        // half-downloaded puppeteer cache entry.
+        assert.ok(fs.existsSync(found), `resolved browser exists: ${found}`);
+        assert.ok(fs.statSync(found).isFile(), 'resolved browser is a file');
+        assert.ok(!/\.zip$/i.test(found), 'never a cache zip');
+    }
+});
+
+test('WA-boot: explicit PUPPETEER_EXECUTABLE_PATH wins when it points at a real file', async () => {
+    // The candidate list puts the env var first, but it is read at module
+    // load — so re-import with a cache-busting query and the env var pointed
+    // at this very node binary (a guaranteed-real file).
+    const old = process.env.PUPPETEER_EXECUTABLE_PATH;
+    process.env.PUPPETEER_EXECUTABLE_PATH = process.execPath;
+    try {
+        const fresh = await import(`../services/whatsapp.service.js?waenv=${Date.now()}`);
+        assert.equal(fresh.findSystemChromium(), process.execPath, 'env path takes priority');
+    } finally {
+        if (old === undefined) delete process.env.PUPPETEER_EXECUTABLE_PATH;
+        else process.env.PUPPETEER_EXECUTABLE_PATH = old;
+    }
 });
