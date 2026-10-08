@@ -1,0 +1,21 @@
+# NOTE: docs/ is intentionally NOT ignored - ARCHITECTURE.md and docs/Flow.md
+# are the project's design documents and belong in version control.
+
+# Local environment configuration and secrets
+.env*
+
+# Installed dependencies
+node_modules/
+
+# Private keys and certificate bundles
+*.pem
+*.key
+*.p12
+*.pfx
+
+.wwebjs_auth
+
+# One-off dev codemods were removed from the repo (they hardcoded developer
+# machine paths). Local scratch scripts:
+__*test*.mjs
+__scratch*.mjs

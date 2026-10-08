@@ -1,0 +1,154 @@
+diff --git a/node_modules/whatsapp-web.js/src/structures/Message.js b/node_modules/whatsapp-web.js/src/structures/Message.js
+index dd977e8..4151e6a 100644
+--- a/node_modules/whatsapp-web.js/src/structures/Message.js
++++ b/node_modules/whatsapp-web.js/src/structures/Message.js
+@@ -35,6 +35,12 @@ class Message extends Base {
+          * @type {object}
+          */
+         this.id = data.id;
++        // WhatsApp Web's July 2026 update renamed id._serialized -> id.$1.
++        // Normalise here so all downstream code that reads ._serialized works
++        // without any further changes (mirrors upstream PR wwebjs#201832).
++        if (this.id && !this.id._serialized && this.id.$1) {
++            this.id._serialized = this.id.$1;
++        }
+ 
+         /**
+          * ACK status for the message
+@@ -566,6 +572,7 @@ class Message extends Base {
+                         mediaKey: msg.mediaKey,
+                         mediaKeyTimestamp: msg.mediaKeyTimestamp,
+                         type: msg.type,
++                        mimetype: msg.mimetype,
+                         signal: new AbortController().signal,
+                         downloadQpl: mockQpl,
+                     });
+@@ -585,7 +592,7 @@ class Message extends Base {
+                 if (e.status && e.status === 404) return undefined;
+                 throw e;
+             }
+-        }, this.id._serialized);
++        }, this.id._serialized || this.id.$1);
+ 
+         if (!result) return undefined;
+         return new MessageMedia(
+diff --git a/node_modules/whatsapp-web.js/src/util/Injected/Utils.js b/node_modules/whatsapp-web.js/src/util/Injected/Utils.js
+index 540078a..f576ba0 100644
+--- a/node_modules/whatsapp-web.js/src/util/Injected/Utils.js
++++ b/node_modules/whatsapp-web.js/src/util/Injected/Utils.js
+@@ -422,6 +422,16 @@ exports.LoadUtils = () => {
+         );
+         const lidUser = getMaybeMeLidUser();
+         const meUser = getMaybeMePnUser();
++        // PATCH: normalize lidUser so its ._serialized property exists.
++        // WhatsApp Web July 2026 renamed ._serialized to .$1 on wid objects.
++        // The media upload memoizer reads .id on the wid which maps to
++        // ._serialized; without this the memoizer throws "id property undefined".
++        if (lidUser && !lidUser._serialized && lidUser.$1) {
++            lidUser._serialized = lidUser.$1;
++        }
++        if (meUser && !meUser._serialized && meUser.$1) {
++            meUser._serialized = meUser.$1;
++        }
+         const newId = await window.require('WAWebMsgKey').newId();
+         let from = chat.id.isLid() ? lidUser : meUser;
+         let participant;
+@@ -483,6 +493,12 @@ exports.LoadUtils = () => {
+             ...extraOptions,
+         };
+ 
++        // FIX (wwebjs#201922, WW 2.3000.1047775310): processMediaData() returns a
++        // MediaData model whose enumerable __x_id collides with Msg's internal
++        // ID when spread above, breaking getValidatedSender() for media/voice.
++        // Text sends work because mediaOptions is empty. Must delete it.
++        delete message.__x_id;
++
+         // Bot's won't reply if canonicalUrl is set (linking)
+         if (botOptions) {
+             delete message.canonicalUrl;
+@@ -582,7 +598,7 @@ exports.LoadUtils = () => {
+ 
+         return window
+             .require('WAWebCollections')
+-            .Msg.get(newMsgKey._serialized);
++            .Msg.get(newMsgKey._serialized || newMsgKey.$1);
+     };
+ 
+     window.WWebJS.editMessage = async (msg, content, options = {}) => {
+@@ -625,7 +641,7 @@ exports.LoadUtils = () => {
+         await window
+             .require('WAWebSendMessageEditAction')
+             .sendMessageEdit(msg, content, internalOptions);
+-        return window.require('WAWebCollections').Msg.get(msg.id._serialized);
++        return window.require('WAWebCollections').Msg.get(msg.id._serialized || msg.id.$1);
+     };
+ 
+     window.WWebJS.toStickerData = async (mediaInfo) => {
+@@ -830,7 +846,7 @@ exports.LoadUtils = () => {
+ 
+         if (typeof msg.id.remote === 'object') {
+             msg.id = Object.assign({}, msg.id, {
+-                remote: msg.id.remote._serialized,
++                remote: msg.id.remote._serialized || msg.id.remote.$1,
+             });
+         }
+ 
+@@ -953,7 +969,7 @@ exports.LoadUtils = () => {
+             model.isGroup = true;
+             const chatWid = window
+                 .require('WAWebWidFactory')
+-                .createWid(chat.id._serialized);
++                .createWid(chat.id._serialized || chat.id.$1);
+             const groupMetadata =
+                 window.require('WAWebCollections').GroupMetadata ||
+                 window.require('WAWebCollections').WAWebGroupMetadataCollection;
+@@ -984,12 +1000,12 @@ exports.LoadUtils = () => {
+             const lastMessage = chat.lastReceivedKey
+                 ? window
+                       .require('WAWebCollections')
+-                      .Msg.get(chat.lastReceivedKey._serialized) ||
++                      .Msg.get(chat.lastReceivedKey._serialized || chat.lastReceivedKey.$1) ||
+                   (
+                       await window
+                           .require('WAWebCollections')
+                           .Msg.getMessagesById([
+-                              chat.lastReceivedKey._serialized,
++                              chat.lastReceivedKey._serialized || chat.lastReceivedKey.$1,
+                           ])
+                   )?.messages?.[0]
+                 : null;
+@@ -1265,7 +1281,9 @@ exports.LoadUtils = () => {
+     window.WWebJS.rejectCall = async (peerJid, id) => {
+         let userId = window
+             .require('WAWebUserPrefsMeUser')
+-            .getMaybeMePnUser()._serialized;
++            .getMaybeMePnUser()._serialized || window
++            .require('WAWebUserPrefsMeUser')
++            .getMaybeMePnUser().$1;
+ 
+         const stanza = window.require('WAWap').wap(
+             'call',
+@@ -1575,9 +1593,7 @@ exports.LoadUtils = () => {
+                                       .membershipRequestsActionRejectParticipantMixins
+                                       ?.value.error;
+                             return {
+-                                requesterId: window
+-                                    .require('WAWebWidFactory')
+-                                    .createWid(p.jid)._serialized,
++                                requesterId: (() => { const _w = window.require('WAWebWidFactory').createWid(p.jid); return _w._serialized || _w.$1; })(),
+                                 ...(error
+                                     ? {
+                                           error: +error,
+@@ -1594,11 +1610,7 @@ exports.LoadUtils = () => {
+                     }
+                 } else {
+                     result.push({
+-                        requesterId: window
+-                            .require('WAWebJidToWid')
+-                            .userJidToUserWid(
+-                                participant.participantArgs[0].participantJid,
+-                            )._serialized,
++                        requesterId: (() => { const _w = window.require('WAWebJidToWid').userJidToUserWid(participant.participantArgs[0].participantJid); return _w._serialized || _w.$1; })(),
+                         message: 'ServerStatusCodeError',
+                     });
+                 }

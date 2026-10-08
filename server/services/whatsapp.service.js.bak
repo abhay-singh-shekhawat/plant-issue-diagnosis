@@ -1,0 +1,303 @@
+import pkg from 'whatsapp-web.js';
+const { Client, LocalAuth, MessageMedia } = pkg;
+import qrcode from 'qrcode-terminal';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { processMessage } from './agent.service.js';
+import { transcribeAudio } from './stt.service.js';
+import { generateAudio } from './tts.service.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Module-level handle so the process can shut down cleanly and reconnect.
+let clientRef = null;
+
+// Judge/demo mode: JUDGE_MODE=true = open bot, welcome message, short voice.
+// Per-number daily cap guards the paid quota when the bot is open to strangers.
+const JUDGE_MODE = String(process.env.JUDGE_MODE || 'false').toLowerCase() === 'true';
+const MAX_DIAG_PER_NUMBER = Number(process.env.MAX_DIAG_PER_NUMBER || 20);
+const diagCountByNumber = new Map(); // senderDigits -> { date: 'YYYY-MM-DD', count: n }
+
+// First-time senders get a short how-to-use guide so a judge with no briefing
+// can use the bot from their own phone in 30 seconds.
+const WELCOME_TEXT = [
+    'Hi! I am your crop doctor bot. 🌱',
+    '',
+    'Send me in ONE chat:',
+    '1) A clear photo of the sick leaf/crop',
+    '2) Your location pin 📍 (Attach → Location)',
+    '',
+    'I will check the photo + weather/soil and reply with the disease + remedy in your language (text + voice).',
+    'You can also send a voice note instead of typing.',
+    '',
+    'Try now — send a crop photo!'
+].join('\n');
+
+/** Closes the Puppeteer/Chromium client so it does not leak on restart. */
+export const destroyWhatsAppClient = async () => {
+    if (!clientRef) return;
+    const client = clientRef;
+    clientRef = null;
+    try {
+        await client.destroy();
+        console.log('[WhatsApp] Client destroyed.');
+    } catch (err) {
+        console.error('[WhatsApp] Error destroying client:', err.message);
+    }
+};
+
+export const initializeWhatsAppClient = () => {
+
+    // Chrome/Chromium is env-driven so the bot works cross-platform.
+    // Empty PUPPETEER_EXECUTABLE_PATH => whatsapp-web.js's bundled Chromium.
+    const puppeteerOptions = {
+        args: ['--no-sandbox', '--disable-setuid-sandbox']
+    };
+    if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+        puppeteerOptions.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+    }
+
+    const client = new Client({
+        authStrategy: new LocalAuth({ dataPath: path.join(__dirname, '../../.wwebjs_auth') }),
+        puppeteer: puppeteerOptions
+    });
+
+    client.on('qr', (qr) => {
+        console.log('\n======================================================');
+        console.log('WhatsApp Bot: Scan this QR code to log in to WhatsApp:');
+        qrcode.generate(qr, { small: true });
+        console.log('======================================================\n');
+    });
+
+    client.on('ready', () => {
+        // WHATSAPP_BOT_NUMBER is display-only (the real login is the QR scan).
+        // Logging it confirms which SIM the session belongs to.
+        const botNumber = (process.env.WHATSAPP_BOT_NUMBER || '').replace(/\D/g, '');
+        console.log(`✅ WhatsApp Client is ready and connected!${botNumber ? ` (bot: +${botNumber})` : ''}`);
+    });
+
+    // --- lifecycle: the bot must not die silently --------------------------
+    client.on('auth_failure', (msg) => {
+        console.error('[WhatsApp] Authentication failed:', msg);
+    });
+
+    client.on('disconnected', (reason) => {
+        console.warn(`[WhatsApp] Disconnected (${reason}). Re-initializing in 5s...`);
+        destroyWhatsAppClient()
+            .then(() => {
+                setTimeout(() => {
+                    try {
+                        initializeWhatsAppClient();
+                    } catch (err) {
+                        console.error('[WhatsApp] Re-initialize failed:', err.message);
+                    }
+                }, 5000);
+            })
+            .catch((err) => console.error('[WhatsApp] Re-initialize failed:', err.message));
+    });
+
+    client.on('change_state', (state) => {
+        console.log(`[WhatsApp] State changed: ${state}`);
+    });
+
+    client.on('message', async (msg) => {
+        const from = msg.from;
+        const msgTag = '[WhatsApp:' + from + ':' + ((msg && msg.id && msg.id._serialized) || 'no-id') + ']';
+        console.log(msgTag + ' incoming type=' + msg.type + ' hasMedia=' + msg.hasMedia + ' bodyLen=' + ((msg.body || '').length));
+
+        // The agent is strictly 1:1. Ignore groups, broadcasts and newsletters —
+        // otherwise `from` is a group id and every member would share one case.
+        if (msg.fromMe) { console.log(msgTag + ' ignored (own message).'); return; }
+        if (from === 'status@broadcast' || /@(g\.us|newsletter|broadcast)$/.test(from)) {
+            return;
+        }
+
+        // Who can use the bot: JUDGE_MODE=true ignores the allowlist (open demo
+        // for unknown judges). Otherwise empty allowlist = everyone, set = only listed.
+        const allowed = (process.env.WHATSAPP_ALLOWED_NUMBERS || '')
+            .split(',')
+            .map((n) => n.replace(/\D/g, ''))
+            .filter(Boolean);
+        let contactNumber = '';
+        try {
+            const contact = await msg.getContact();
+            contactNumber = String((contact && contact.number) || '').replace(/\D/g, '');
+        } catch (ce) { console.warn(msgTag + ' getContact failed: ' + ((ce && ce.message) || ce)); }
+        const senderDigits = contactNumber || String(from.split('@')[0] || '').replace(/\D/g, '');
+        if (!JUDGE_MODE && allowed.length > 0) {
+            const senderShort = senderDigits.replace(/^91(?=\d{10}$)/, '');
+            const isAllowed = allowed.some((a) => {
+                const norm = a.replace(/^91(?=\d{10}$)/, '');
+                return senderDigits === a || senderShort === norm || senderDigits.endsWith(norm);
+            });
+            if (!isAllowed) {
+                console.warn(msgTag + ' BLOCKED by allowlist from=' + from + ' contact=' + (contactNumber || 'n/a') + ' allowed=[' + allowed.join(',') + ']');
+                try { await client.sendMessage(from, 'Sorry, this bot is in private testing and your number is not on the access list.'); } catch (e2) {}
+                return;
+            }
+            console.log(msgTag + ' allowlist OK sender=' + senderDigits);
+        }
+
+        // Quota guard for open demos: max N diagnoses per number per day.
+        // Counts only messages that reach the brain (not group spam filtered above).
+        if (JUDGE_MODE && Number.isFinite(MAX_DIAG_PER_NUMBER) && MAX_DIAG_PER_NUMBER > 0) {
+            const today = new Date().toISOString().slice(0, 10);
+            const entry = diagCountByNumber.get(senderDigits);
+            if (entry && entry.date === today && entry.count >= MAX_DIAG_PER_NUMBER) {
+                await client.sendMessage(from, `Demo limit reached (${MAX_DIAG_PER_NUMBER}/day for this number). Please try again tomorrow.`);
+                return;
+            }
+            diagCountByNumber.set(senderDigits, {
+                date: today,
+                count: entry && entry.date === today ? entry.count + 1 : 1
+            });
+        }
+
+        // First message from this number in judge mode → welcome + how-to-use.
+        // Sent once (tracked in-memory + survives via session map), then normal flow.
+        if (JUDGE_MODE && !globalThis.__waWelcomed?.has(senderDigits)) {
+            if (!globalThis.__waWelcomed) globalThis.__waWelcomed = new Set();
+            globalThis.__waWelcomed.add(senderDigits);
+            try { await client.sendMessage(from, WELCOME_TEXT); } catch { /* ignore */ }
+            // If they sent only "hi", stop after welcome — wait for real photo.
+            const bodyText = (msg.body || '').trim().toLowerCase();
+            if (!msg.hasMedia && !msg.location && ['hi', 'hello', 'hey', 'hii', ''].includes(bodyText)) return;
+        }
+
+        const extractedData = {
+            sessionId: from,
+            source: 'whatsapp',
+            // Keep photo captions: they can carry a command ("new" / "same") and
+            // they are useful context for the agent.
+            text: msg.body && typeof msg.body === 'string' && !msg.location ? msg.body : '',
+            imageUrl: null,
+            coordinates: null,
+            language: null
+        };
+
+        try {
+            if (msg.hasMedia) {
+                console.log(msgTag + ' downloading media...');
+                let media = null;
+                try { media = await msg.downloadMedia(); }
+                catch (dlErr) {
+                    console.error(msgTag + ' downloadMedia threw: ' + ((dlErr && dlErr.stack) || dlErr));
+                    try { await client.sendMessage(from, 'I could not download that image. Please resend it as a photo.'); } catch (e2) {}
+                    return;
+                }
+                if (!media || !media.data) {
+                    console.error(msgTag + ' downloadMedia empty; asking user to resend.');
+                    try { await client.sendMessage(from, 'I could not download that image. Please resend it as a photo.'); } catch (e2) {}
+                    return;
+                }
+                console.log(msgTag + ' media ' + media.mimetype + ' b64len=' + (media.data || '').length);
+
+                if (media && media.mimetype && media.mimetype.startsWith('image/')) {
+                    const extension = media.mimetype.split('/')[1].split(';')[0] || 'jpg';
+                    const filename = `whatsapp-${Date.now()}.${extension}`;
+
+                    const destDir = path.join(__dirname, '../user_img_whatsapp');
+                    if (!fs.existsSync(destDir)) {
+                        fs.mkdirSync(destDir, { recursive: true });
+                    }
+
+                    const filepath = path.join(destDir, filename);
+                    fs.writeFileSync(filepath, media.data, 'base64');
+
+                    extractedData.imageUrl = `/user_img_whatsapp/${filename}`;
+                } else if (media && media.mimetype && (media.mimetype.startsWith('audio/') || media.mimetype.includes('ogg'))) {
+                    // Handle Voice Notes
+                    const extension = media.mimetype.split('/')[1].split(';')[0] || 'ogg';
+                    const filename = `whatsapp-audio-${Date.now()}.${extension}`;
+
+                    const destDir = path.join(__dirname, '../user_audio_whatsapp');
+                    if (!fs.existsSync(destDir)) {
+                        fs.mkdirSync(destDir, { recursive: true });
+                    }
+
+                    const filepath = path.join(destDir, filename);
+                    fs.writeFileSync(filepath, media.data, 'base64');
+
+                    // Voice note → text (Deepgram). Always delete the raw file after.
+                    const sttResult = await transcribeAudio(filepath);
+                    // The raw voice note has served its purpose (or failed to) —
+                    // always reclaim the disk space, STT result or not.
+                    try { fs.unlinkSync(filepath); } catch { /* ignore */ }
+                    if (sttResult.text) {
+                        extractedData.text = sttResult.text;
+                        extractedData.language = sttResult.language || null;
+                    } else {
+                        await client.sendMessage(from, 'I could not clearly understand the voice note. Please try recording again.');
+                        return;
+                    }
+                }
+            } else {
+                console.warn(msgTag + ' unsupported media: ' + (media && media.mimetype));
+                        try { await client.sendMessage(from, 'Please send a crop photo, a voice note, or a location pin. That file type is not supported.'); } catch (e2) {}
+                        return;
+                    }
+                }
+            }
+
+            // Check for Location
+            if (msg.location) {
+                extractedData.coordinates = {
+                    lat: msg.location.latitude,
+                    lon: msg.location.longitude
+                };
+            }
+
+            console.log(msgTag + ' extracted image=' + (extractedData.imageUrl || 'none') + ' textLen=' + ((extractedData.text || '').length));
+            console.log(msgTag + ' calling processMessage...');
+            const aiResult = await processMessage(extractedData);
+            console.log(msgTag + ' processMessage done replyLen=' + (((aiResult && aiResult.text) || '').length));
+
+            if (aiResult.text && aiResult.text.length > 0) {
+                // Text first (fast), then voice note in the same language.
+                const userLang = aiResult?.language || extractedData.language || 'hi';
+
+                // Judge mode: shorten voice to first 2 sentences so the stage demo
+                // stays under ~15s. Full text is still sent as the message above.
+                let voiceText = aiResult.text;
+                if (JUDGE_MODE) {
+                    const sentences = String(aiResult.text).match(/[^.?!।\n]+[.?!।\n]*/g) || [aiResult.text];
+                    voiceText = sentences.slice(0, 2).join(' ').trim() || aiResult.text;
+                }
+                const audioPath = await generateAudio(voiceText, userLang);
+
+                try { await client.sendMessage(from, aiResult.text); console.log(msgTag + ' text reply sent.'); }
+                catch (se) { console.error(msgTag + ' sendMessage FAILED: ' + ((se && se.stack) || se)); }
+
+                if (audioPath && fs.existsSync(audioPath)) {
+                    const audioMedia = MessageMedia.fromFilePath(audioPath);
+                    await client.sendMessage(from, audioMedia, { sendAudioAsVoice: true });
+
+                    // Voice note delivered — delete the temp .ogg.
+                    try { fs.unlinkSync(audioPath); } catch { /* ignore */ }
+                }
+            } else {
+                console.error(msgTag + ' EMPTY reply; sending fallback.');
+                try { await client.sendMessage(from, 'I got that but could not form a reply. Please send a crop photo and location pin.'); } catch (e2) {}
+            }
+
+        } catch (err) {
+            console.error(msgTag + ' handler exception:', (err && err.stack) || err);
+            await client.sendMessage(from, 'An error occurred while processing your message. Please try again.');
+        }
+    });
+
+    
+    clientRef = client;
+
+    // initialize() returns a promise; an unhandled rejection here would crash
+    // the whole API process, so it must always be caught.
+    client.initialize().catch((err) => {
+        console.error('[WhatsApp] Could not start the WhatsApp client:', err.message);
+        console.error('[WhatsApp] The server keeps running in WEB-ONLY mode.');
+        clientRef = null;
+    });
+
+    return client;
+};
