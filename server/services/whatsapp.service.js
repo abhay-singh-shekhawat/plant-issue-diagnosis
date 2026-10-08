@@ -314,15 +314,56 @@ const startReadyWatchdog = (client, isReady) => {
     }, 5000);
 };
 
+/**
+ * Candidate Chromium executables when PUPPETEER_EXECUTABLE_PATH is unset.
+ * Order: explicit env first, then common Windows install locations
+ * (Chrome → Brave → Edge — all Chromium-based, all work with whatsapp-web.js).
+ * The puppeteer cache is deliberately NOT consulted: its layout is versioned
+ * and a half-downloaded cache produces the confusing "Could not find Chrome
+ * (ver. …)" error this fallback exists to avoid.
+ * NOTE: Use forward slashes — they work on Windows and avoid double-escaping
+ * bugs when the path is passed through JSON serialization layers.
+ */
+const SYSTEM_CHROMIUM_CANDIDATES = [
+    process.env.PUPPETEER_EXECUTABLE_PATH || '',
+    'C:/Program Files/Google/Chrome/Application/chrome.exe',
+    'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe',
+    'C:/Program Files/BraveSoftware/Brave-Browser/Application/brave.exe',
+    'C:/Program Files (x86)/BraveSoftware/Brave-Browser/Application/brave.exe',
+    'C:/Program Files/Microsoft/Edge/Application/msedge.exe',
+    'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'
+];
+
+/** First existing executable from the candidate list, or '' when none found. */
+export const findSystemChromium = () => {
+    for (const candidate of SYSTEM_CHROMIUM_CANDIDATES) {
+        if (!candidate) continue;
+        try {
+            if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+        } catch { /* unreadable path — try next */ }
+    }
+    return '';
+};
+
 export const initializeWhatsAppClient = () => {
 
-    // Chrome/Chromium is env-driven so the bot works cross-platform.
-    // Empty PUPPETEER_EXECUTABLE_PATH => whatsapp-web.js's bundled Chromium.
+    // Chrome/Chromium resolution: explicit PUPPETEER_EXECUTABLE_PATH wins;
+    // otherwise auto-detect a system Chromium (Chrome → Brave → Edge).
+    // Only when nothing is found do we fall through to the library default
+    // (puppeteer cache), which prints WEB-ONLY mode instead of crashing.
+    // NOTE: headless: 'new' is required on Windows when the user runs a
+    // *different* Brave/Chrome in the foreground — windowed mode fights for
+    // the GPU/profile lock and hangs at Runtime.callFunctionOn. protocolTimeout
+    // is raised because first launch (cold cache) exceeds the 180 s default.
     const puppeteerOptions = {
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
+        headless: 'new',
+        protocolTimeout: 300000,
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu', '--disable-dev-shm-usage']
     };
-    if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-        puppeteerOptions.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+    const resolvedBrowser = findSystemChromium();
+    if (resolvedBrowser) {
+        puppeteerOptions.executablePath = resolvedBrowser;
+        console.log(`[WhatsApp] Using system browser: ${resolvedBrowser}`);
     }
 
     const client = new Client({
