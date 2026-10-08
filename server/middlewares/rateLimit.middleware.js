@@ -2,13 +2,16 @@
  * Minimal dependency-free fixed-window rate limiter.
  * Protects the paid Gemini / Sarvam / Deepgram quotas from abuse.
  */
+import { envNum } from '../env.js';
+
 const hits = new Map();
 
 const WINDOW_MS = 60 * 1000;
 
 // Read per-request (not at module load) so the limit is tunable at runtime and
-// testable without re-importing the module.
-const maxRequests = () => Number(process.env.RATE_LIMIT_PER_MINUTE || 30);
+// testable without re-importing the module. Validated: garbage like "abc" falls
+// back to 30 instead of NaN (which would disable the limiter entirely).
+const maxRequests = () => envNum('RATE_LIMIT_PER_MINUTE', 30);
 
 export const rateLimit = (req, res, next) => {
     try {

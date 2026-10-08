@@ -23,8 +23,10 @@ const ChatMessages = ({ messages }) => {
         </div>
       ) : (
         messages.map((msg, index) => (
-          <div 
-            key={index} 
+          <div
+            // Stable identity per bubble: index keys mis-associate bubbles with
+            // timestamps after the optimistic filter-rollback on failed sends.
+            key={msg.message_id || `msg-${index}`}
             className={`flex ${msg.sender === 'web' ? 'justify-end' : 'justify-start'}`}
           >
             <div className={`max-w-[75%] rounded-2xl p-3 shadow-sm ${msg.sender === 'web' ? 'bg-blue-100 rounded-tr-none' : 'bg-white border rounded-tl-none'}`}>
@@ -48,10 +50,14 @@ const ChatMessages = ({ messages }) => {
                   </div>
               )}
 
-              {/* Text part of message if available (agent replies are Markdown) */}
+              {/* Text part of message if available (agent replies are Markdown).
+                  Explicit urlTransform (same policy as react-markdown's default):
+                  only http/https/mailto links and images load; javascript:/data:
+                  URIs from model output render as plain text. Pinned here so the
+                  guarantee survives library upgrades, not just today's default. */}
               {msg.text && (
                   <div className="text-sm text-gray-800 whitespace-pre-wrap prose prose-sm max-w-none prose-p:my-1 prose-ul:my-1 prose-ol:my-1 prose-headings:my-1">
-                    <ReactMarkdown>{msg.text}</ReactMarkdown>
+                    <ReactMarkdown urlTransform={(url) => (/^(https?|mailto):/i.test(url) || url.startsWith('/') || url.startsWith('#') || !/^[a-z][a-z0-9+.-]*:/i.test(url) ? url : '')}>{msg.text}</ReactMarkdown>
                   </div>
               )}
 

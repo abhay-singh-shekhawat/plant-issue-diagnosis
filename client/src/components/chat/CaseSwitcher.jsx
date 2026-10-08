@@ -10,7 +10,7 @@ const STATUS_DOT = {
  * Horizontal strip of the farmer's open cases (crop problems).
  * Lets them jump between two diseases at once, or start a brand new problem.
  */
-const CaseSwitcher = ({ conversation, onSelectCase, onNewCase }) => {
+const CaseSwitcher = ({ conversation, busy = false, onSelectCase, onNewCase }) => {
   const cases = conversation?.cases || [];
   if (cases.length === 0) return null;
 
@@ -24,8 +24,9 @@ const CaseSwitcher = ({ conversation, onSelectCase, onNewCase }) => {
           <button
             key={c.caseId}
             onClick={() => onSelectCase(c.caseId)}
+            disabled={busy}
             title={`${c.label} (${c.status})`}
-            className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs whitespace-nowrap border transition-colors ${
+            className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs whitespace-nowrap border transition-colors disabled:opacity-50 disabled:cursor-wait ${
               isActive
                 ? 'bg-blue-600 text-white border-blue-600'
                 : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-100'
@@ -40,7 +41,8 @@ const CaseSwitcher = ({ conversation, onSelectCase, onNewCase }) => {
 
       <button
         onClick={onNewCase}
-        className="ml-auto shrink-0 px-3 py-1 rounded-full text-xs border border-blue-600 text-blue-600 hover:bg-blue-50 whitespace-nowrap"
+        disabled={busy}
+        className="ml-auto shrink-0 px-3 py-1 rounded-full text-xs border border-blue-600 text-blue-600 hover:bg-blue-50 whitespace-nowrap disabled:opacity-50 disabled:cursor-wait"
       >
         + New problem
       </button>

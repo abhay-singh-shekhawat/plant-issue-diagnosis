@@ -7,6 +7,8 @@ import { fileURLToPath } from 'url';
 import { processMessage } from './agent.service.js';
 import { transcribeAudio } from './stt.service.js';
 import { generateAudio } from './tts.service.js';
+import { envNum } from '../env.js';
+import { coerceLanguage } from '../language.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -16,6 +18,33 @@ let clientRef = null;
 
 // Running count of messages silently ignored due to allowlist.
 let ignoredMessageCount = 0;
+
+// Reconnect backoff state (module-level: survives across re-inits in one run).
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 6;  // then stop and wait for a manual restart
+const RECONNECT_BASE_MS = 5000;    // 5s, 10s, 20s, 40s, 80s, 160s (capped below)
+const RECONNECT_MAX_MS = 120000;   // cap a single wait at 2 min
+
+/** Backoff delay for the Nth reconnect attempt (1-based). Pure — tested. */
+export const reconnectDelayMs = (attempt) =>
+    Math.min(RECONNECT_BASE_MS * 2 ** (Math.max(1, attempt) - 1), RECONNECT_MAX_MS);
+
+export const __reconnectForTest = {
+    get attempts() { return reconnectAttempts; },
+    reset() { reconnectAttempts = 0; }
+};
+
+/**
+ * Stable sender identity for quota + welcome keys. Prefers a phone-number-shaped
+ * candidate (10 digits, optional 91 prefix) over a LID: uniqueSenders[0] order
+ * depends on which contact fields exist, so LID-first orderings keyed quota on
+ * the LID while phone-first keyed on the number — double-dip + repeat welcome.
+ * Pure — tested.
+ */
+export const selectSenderDigits = (uniqueSenders) => {
+    const list = Array.isArray(uniqueSenders) ? uniqueSenders : [];
+    return list.find((c) => /^(91)?\d{10}$/.test(c)) || list[0] || '';
+};
 
 /**
  * Retries msg.downloadMedia() up to MAX_ATTEMPTS times with exponential backoff.
@@ -52,7 +81,9 @@ const downloadMediaWithRetry = async (msg, tag = '') => {
 // Judge/demo mode: JUDGE_MODE=true = open bot, welcome message, short voice.
 // Per-number daily cap guards the paid quota when the bot is open to strangers.
 const JUDGE_MODE = String(process.env.JUDGE_MODE || 'false').toLowerCase() === 'true';
-const MAX_DIAG_PER_NUMBER = Number(process.env.MAX_DIAG_PER_NUMBER || 20);
+// Validated: garbage like "abc" falls back to 20 instead of NaN (NaN would
+// silently disable the per-number demo quota).
+const MAX_DIAG_PER_NUMBER = envNum('MAX_DIAG_PER_NUMBER', 20);
 const diagCountByNumber = new Map(); // senderDigits -> { date: 'YYYY-MM-DD', count: n }
 
 // First-time senders get a short how-to-use guide so a judge with no briefing
@@ -142,6 +173,19 @@ const ensureSingleControlledTab = async (client, isReady) => {
 };
 
 /**
+ * Extracts a safe file extension from a mimetype (`image/jpeg` → `jpeg`).
+ * Returns '' on slash-less or malformed input instead of throwing (the old
+ * `mimetype.split('/')[1].split(...)` chain crashed with TypeError on `ogg`).
+ * Non-alphanumeric chars are stripped so the value is filename-safe.
+ */
+export const safeExt = (mimetype) => {
+    if (typeof mimetype !== 'string') return '';
+    const parts = mimetype.split('/');
+    if (parts.length < 2 || !parts[1]) return '';
+    return parts[1].split(';')[0].replace(/[^a-z0-9]/gi, '').slice(0, 10);
+};
+
+/**
  * True when ANY of the sender's known id forms matches the configured allowlist.
  *
  * WhatsApp can deliver a 1:1 message from a LID ("linked id") rather than the
@@ -166,7 +210,11 @@ export const isSenderAllowed = (senderCandidates, allowedNumbers) => {
         const candidateShort = candidate.replace(/^91(?=\d{10}$)/, '');
         return allowed.some((a) => {
             const norm = a.replace(/^91(?=\d{10}$)/, '');
-            return candidate === a || candidateShort === norm || candidate.endsWith(norm);
+            // Exact match only (after 91-strip). A suffix check like endsWith()
+            // would admit wrong numbers: e.g. attacker 998426078507 ends with
+            // victim 8426078507. LID ids never collide with phone digits, so a
+            // plain LID allowlist entry still matches exactly when listed.
+            return candidate === a || candidateShort === norm;
         });
     });
 };
@@ -298,6 +346,7 @@ export const initializeWhatsAppClient = () => {
 
     client.on('ready', async () => {
         readyFired = true;
+        reconnectAttempts = 0; // healthy again — reset the backoff ladder
         const botNumber = (process.env.WHATSAPP_BOT_NUMBER || '').replace(/\D/g, '');
         console.log(`✅ WhatsApp Client is ready and connected!${botNumber ? ` (bot: +${botNumber})` : ''}`);
     });
@@ -307,8 +356,18 @@ export const initializeWhatsAppClient = () => {
         console.error('[WhatsApp] Authentication failed:', msg);
     });
 
+    // Reconnect with exponential backoff + cap: the old fixed-5s retry looped
+    // forever on a flap (bad session, no network), spamming init attempts.
+    // Caps at 6 tries (~5m total), then stops and waits for a manual restart.
     client.on('disconnected', (reason) => {
-        console.warn(`[WhatsApp] Disconnected (${reason}). Re-initializing in 5s...`);
+        reconnectAttempts += 1;
+        if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+            console.error(`[WhatsApp] Disconnected (${reason}). Giving up after ${MAX_RECONNECT_ATTEMPTS} retries — restart the server (or delete .wwebjs_auth/ for a fresh login).`);
+            destroyWhatsAppClient().catch(() => { /* already down */ });
+            return;
+        }
+        const delayMs = reconnectDelayMs(reconnectAttempts);
+        console.warn(`[WhatsApp] Disconnected (${reason}). Re-initializing in ${Math.round(delayMs / 1000)}s (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
         destroyWhatsAppClient()
             .then(() => {
                 setTimeout(() => {
@@ -317,7 +376,7 @@ export const initializeWhatsAppClient = () => {
                     } catch (err) {
                         console.error('[WhatsApp] Re-initialize failed:', err.message);
                     }
-                }, 5000);
+                }, delayMs);
             })
             .catch((err) => console.error('[WhatsApp] Re-initialize failed:', err.message));
     });
@@ -364,7 +423,7 @@ export const initializeWhatsAppClient = () => {
         // Raw JID digits last: the only fallback left when the lookup fails.
         senderCandidates.push(digitsOnly(from.split('@')[0]));
         const uniqueSenders = [...new Set(senderCandidates.filter(Boolean))];
-        const senderDigits = uniqueSenders[0] || '';
+        const senderDigits = selectSenderDigits(uniqueSenders);
 
         if (!JUDGE_MODE && allowed.length > 0) {
             if (!isSenderAllowed(uniqueSenders, allowed)) {
@@ -375,8 +434,22 @@ export const initializeWhatsAppClient = () => {
             console.log(msgTag + ' allowlist OK sender=' + uniqueSenders.join('|'));
         }
 
+        // First message from this number in judge mode → welcome + how-to-use.
+        // Sent once (tracked in-memory + survives via session map), then normal flow.
+        // Runs BEFORE the quota guard: a bare "hi" is a greeting, not a
+        // diagnosis, and must never burn quota (the old order incremented first).
+        if (JUDGE_MODE && !globalThis.__waWelcomed?.has(senderDigits)) {
+            if (!globalThis.__waWelcomed) globalThis.__waWelcomed = new Set();
+            globalThis.__waWelcomed.add(senderDigits);
+            try { await msg.reply(WELCOME_TEXT); } catch { /* ignore */ }
+            // If they sent only "hi", stop after welcome — wait for real photo.
+            const bodyText = (msg.body || '').trim().toLowerCase();
+            if (!msg.hasMedia && !msg.location && ['hi', 'hello', 'hey', 'hii', ''].includes(bodyText)) return;
+        }
+
         // Quota guard for open demos: max N diagnoses per number per day.
-        // Counts only messages that reach the brain (not group spam filtered above).
+        // Counts only messages that reach the brain (not group spam or bare
+        // greetings filtered above).
         if (JUDGE_MODE && Number.isFinite(MAX_DIAG_PER_NUMBER) && MAX_DIAG_PER_NUMBER > 0) {
             const today = new Date().toISOString().slice(0, 10);
             const entry = diagCountByNumber.get(senderDigits);
@@ -388,17 +461,6 @@ export const initializeWhatsAppClient = () => {
                 date: today,
                 count: entry && entry.date === today ? entry.count + 1 : 1
             });
-        }
-
-        // First message from this number in judge mode → welcome + how-to-use.
-        // Sent once (tracked in-memory + survives via session map), then normal flow.
-        if (JUDGE_MODE && !globalThis.__waWelcomed?.has(senderDigits)) {
-            if (!globalThis.__waWelcomed) globalThis.__waWelcomed = new Set();
-            globalThis.__waWelcomed.add(senderDigits);
-            try { await msg.reply(WELCOME_TEXT); } catch { /* ignore */ }
-            // If they sent only "hi", stop after welcome — wait for real photo.
-            const bodyText = (msg.body || '').trim().toLowerCase();
-            if (!msg.hasMedia && !msg.location && ['hi', 'hello', 'hey', 'hii', ''].includes(bodyText)) return;
         }
 
         const extractedData = {
@@ -430,7 +492,7 @@ export const initializeWhatsAppClient = () => {
                 console.log(msgTag + ' media ' + media.mimetype + ' b64len=' + (media.data || '').length);
 
                 if (media && media.mimetype && media.mimetype.startsWith('image/')) {
-                    const extension = media.mimetype.split('/')[1].split(';')[0] || 'jpg';
+                    const extension = safeExt(media.mimetype) || 'jpg';
                     const filename = `whatsapp-${Date.now()}.${extension}`;
 
                     const destDir = path.join(__dirname, '../user_img_whatsapp');
@@ -444,7 +506,7 @@ export const initializeWhatsAppClient = () => {
                     extractedData.imageUrl = `/user_img_whatsapp/${filename}`;
                 } else if (media && media.mimetype && (media.mimetype.startsWith('audio/') || media.mimetype.includes('ogg'))) {
                     // Handle Voice Notes
-                    const extension = media.mimetype.split('/')[1].split(';')[0] || 'ogg';
+                    const extension = safeExt(media.mimetype) || 'ogg';
                     const filename = `whatsapp-audio-${Date.now()}.${extension}`;
 
                     const destDir = path.join(__dirname, '../user_audio_whatsapp');
@@ -495,7 +557,13 @@ export const initializeWhatsAppClient = () => {
             const sendMedia = async (media, opts) => client.sendMessage(from, media, opts);
 
             if (aiResult.text && aiResult.text.length > 0) {
-                const userLang = aiResult?.language || extractedData.language || 'hi';
+                // R3 boundary: all three sources are untrusted (agent output,
+                // STT detection, raw request). coerceLanguage never throws and
+                // never returns a non-canonical code, so the TTS call below
+                // always gets a supported voice language.
+                const userLang = coerceLanguage(
+                    aiResult?.language || extractedData.language || 'hi'
+                );
 
                 let voiceText = aiResult.text;
                 if (JUDGE_MODE) {
@@ -504,7 +572,20 @@ export const initializeWhatsAppClient = () => {
                 }
                 const audioPath = await generateAudio(voiceText, userLang);
 
-                if (extractedData.isVoiceNote && audioPath && fs.existsSync(audioPath)) {
+                if (extractedData.isVoiceNote && !(audioPath && fs.existsSync(audioPath))) {
+                    // Voice note in, but no voice note out (TTS down / no key):
+                    // say so explicitly instead of silently sending a text wall.
+                    console.warn(msgTag + ' TTS unavailable — voice-in gets text reply with notice.');
+                    try {
+                        await sendText(
+                            'वॉइस नोट अभी उपलब्ध नहीं है, इसलिए जवाब टेक्स्ट में भेज रहा हूं।\n' +
+                            'Voice note is unavailable right now, so here is the answer in text.\n\n' +
+                            aiResult.text
+                        );
+                    } catch (se) {
+                        console.error(msgTag + ' voice-downgrade text FAILED: ' + ((se && se.stack) || se));
+                    }
+                } else if (extractedData.isVoiceNote && audioPath && fs.existsSync(audioPath)) {
                     // Voice note in → voice note reply only (no text wall).
                     try {
                         const audioMedia = MessageMedia.fromFilePath(audioPath);

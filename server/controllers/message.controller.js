@@ -9,13 +9,19 @@ import { serializeConversation } from '../services/session.service.js';
 export const handleChatMessage = async (req, res) => {
     try {
         const {
-            sessionId = 'web_guest_user',
+            sessionId = null,
             source = 'web',
             text = '',
             action = null,
             caseId = null,
             language = null
         } = req.body || {};
+
+        // No shared guest bucket: every caller must identify its own session.
+        // The web UI always sends a per-browser UUID; WhatsApp sends the JID.
+        if (typeof sessionId !== 'string' || !sessionId.trim()) {
+            return res.status(400).json({ error: 'sessionId is required' });
+        }
 
         const aiResult = await processMessage({
             sessionId,

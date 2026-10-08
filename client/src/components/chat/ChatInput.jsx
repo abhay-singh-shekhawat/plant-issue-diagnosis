@@ -6,6 +6,10 @@ const ChatInput = ({ onSendMessage, onSendText, disabled }) => {
     const [draft, setDraft] = useState('');
     const [isLocating, setIsLocating] = useState(false);
     const [isSendingText, setIsSendingText] = useState(false);
+    const [fileError, setFileError] = useState('');
+    // Mirrors isSendingRef (a non-rendering ref) in state so the Send button
+    // reflects the guard during slow geolocation/IP fallback.
+    const [sendingImage, setSendingImage] = useState(false);
     const fileInputRef = useRef(null);
     const isSendingRef = useRef(false);
 
@@ -28,13 +32,31 @@ const ChatInput = ({ onSendMessage, onSendText, disabled }) => {
         });
     };
 
+    // Client-side gate mirrors the server (multer: image/*, 10 MB). Rejecting
+    // early avoids building an optimistic bubble that fails only after upload.
+    const MAX_FILE_BYTES = 10 * 1024 * 1024;
     const handleFileChange = (e) => {
         const file = e.target.files[0];
-        if (file) {
-            setImage(file);
-            replacePreview(file);
-            isSendingRef.current = false;
+        if (!file) return;
+        if (!file.type || !file.type.startsWith('image/')) {
+            setFileError('Please choose an image file (photo of the crop).');
+            if (fileInputRef.current) fileInputRef.current.value = '';
+            return;
         }
+        if (file.size === 0) {
+            setFileError('That file is empty — please choose another photo.');
+            if (fileInputRef.current) fileInputRef.current.value = '';
+            return;
+        }
+        if (file.size > MAX_FILE_BYTES) {
+            setFileError('Photo is larger than 10 MB — please choose a smaller one.');
+            if (fileInputRef.current) fileInputRef.current.value = '';
+            return;
+        }
+        setFileError('');
+        setImage(file);
+        replacePreview(file);
+        isSendingRef.current = false;
     };
 
     const handleSend = async (e) => {
@@ -45,11 +67,37 @@ const ChatInput = ({ onSendMessage, onSendText, disabled }) => {
         
         if (!image || isSendingRef.current) return;
 
+        // Hold the send guard until the parent settles (not just fires):
+        // releasing it synchronously after fire allowed double-click double
+        // uploads. Visual state clears now; the guard releases in settleSend.
         isSendingRef.current = true;
         const imageToSend = image; // Take a snapshot and clear local state immediately
         const noteToSend = draft.trim(); // Optional caption typed next to the photo
         setIsLocating(true);
-        
+        setImage(null);
+        replacePreview(null);
+        setDraft('');
+        if (fileInputRef.current) fileInputRef.current.value = '';
+
+        const settleSend = () => {
+            isSendingRef.current = false;
+            setIsLocating(false);
+        };
+
+        const dispatchSend = (coordinates) => {
+            try {
+                const out = onSendMessage(imageToSend, coordinates, noteToSend);
+                // Parent is async: release the guard when it settles so a second
+                // pick+send during a long diagnosis is possible but never a
+                // duplicate of THIS send (isSendingRef was true throughout).
+                if (out && typeof out.finally === 'function') out.finally(settleSend);
+                else settleSend();
+            } catch (err) {
+                console.error('Send dispatch failed:', err);
+                settleSend();
+            }
+        };
+
         let hasProcessed = false; // Ensures onSendMessage is strictly called once
         let fallbackStarted = false; // Protects against browser firing multiple error callbacks
 
@@ -57,30 +105,32 @@ const ChatInput = ({ onSendMessage, onSendText, disabled }) => {
             if (fallbackStarted) return;
             fallbackStarted = true;
 
+            // IP fallback is best-effort with a hard timeout: a hung ipapi call
+            // must never wedge the UI on "Sending...". Invalid payloads degrade
+            // to null coords (the server asks for a location pin instead).
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), 8000);
             try {
                 // Fallback to IP-based location if browser geolocation fails
-                const response = await fetch('https://ipapi.co/json/');
+                const response = await fetch('https://ipapi.co/json/', { signal: ctrl.signal });
+                if (!response.ok) throw new Error(`ipapi HTTP ${response.status}`);
                 const data = await response.json();
-                if (data && data.latitude && data.longitude) {
-                    if (!hasProcessed) {
-                        hasProcessed = true;
-                        onSendMessage(imageToSend, { lat: data.latitude, lon: data.longitude }, noteToSend);
-                        resetInput();
-                    }
-                } else {
-                    if (!hasProcessed) {
-                        hasProcessed = true;
-                        onSendMessage(imageToSend, null, noteToSend);
-                        resetInput();
-                    }
+                const lat = Number(data && data.latitude);
+                const lon = Number(data && data.longitude);
+                if (!hasProcessed) {
+                    hasProcessed = true;
+                    dispatchSend(
+                        Number.isFinite(lat) && Number.isFinite(lon) ? { lat, lon } : null
+                    );
                 }
             } catch (fallbackError) {
                 console.error("Fallback location also failed", fallbackError);
                 if (!hasProcessed) {
                     hasProcessed = true;
-                    onSendMessage(imageToSend, null, noteToSend);
-                    resetInput();
+                    dispatchSend(null);
                 }
+            } finally {
+                clearTimeout(timer);
             }
         };
 
@@ -93,8 +143,7 @@ const ChatInput = ({ onSendMessage, onSendText, disabled }) => {
                         lat: position.coords.latitude,
                         lon: position.coords.longitude
                     };
-                    onSendMessage(imageToSend, coordinates, noteToSend);
-                    resetInput();
+                    dispatchSend(coordinates);
                 },
                 (error) => {
                     console.warn(`Browser geolocation error (${error.code}): ${error.message}. Attempting fallback...`);
@@ -113,6 +162,7 @@ const ChatInput = ({ onSendMessage, onSendText, disabled }) => {
         replacePreview(null);
         setIsLocating(false);
         setDraft('');
+        setFileError('');
         isSendingRef.current = false;
         if (fileInputRef.current) {
             fileInputRef.current.value = '';
@@ -141,10 +191,27 @@ const ChatInput = ({ onSendMessage, onSendText, disabled }) => {
         }
     };
 
-    const busy = isLocating || isSendingText || disabled;
+    const busy = isLocating || isSendingText || sendingImage || disabled;
+
+    const guardedSend = (e) => {
+        if (image) {
+            if (isSendingRef.current) return;
+            setSendingImage(true);
+            Promise.resolve()
+                .then(() => handleSend(e))
+                .finally(() => setSendingImage(false));
+        } else {
+            handleTextSend(e);
+        }
+    };
 
     return (
         <div className="p-4 bg-white border-t border-gray-200 sticky bottom-0">
+            {fileError && (
+                <div className="mb-2 text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+                    {fileError}
+                </div>
+            )}
             {previewUrl && (
                 <div className="mb-4 relative inline-block">
                     <img src={previewUrl} alt="Preview" className="h-32 rounded-lg object-cover border border-gray-300" />
@@ -156,7 +223,7 @@ const ChatInput = ({ onSendMessage, onSendText, disabled }) => {
                     </button>
                 </div>
             )}
-            <form onSubmit={(e) => (image ? handleSend(e) : handleTextSend(e))} className="flex items-center gap-2">
+            <form onSubmit={guardedSend} className="flex items-center gap-2">
                 <input
                     type="file"
                     accept="image/*"
@@ -187,10 +254,10 @@ const ChatInput = ({ onSendMessage, onSendText, disabled }) => {
 
                 <button
                     type="submit"
-                    disabled={(image ? false : !draft.trim()) || isLocating || isSendingText}
-                    className={`px-4 py-2 rounded-full font-medium ${(image ? false : !draft.trim()) || isLocating || isSendingText ? 'bg-gray-300 text-gray-500 cursor-not-allowed' : 'bg-blue-600 text-white hover:bg-blue-700'}`}
+                    disabled={(image ? false : !draft.trim()) || busy}
+                    className={`px-4 py-2 rounded-full font-medium ${(image ? false : !draft.trim()) || busy ? 'bg-gray-300 text-gray-500 cursor-not-allowed' : 'bg-blue-600 text-white hover:bg-blue-700'}`}
                 >
-                    {isLocating ? 'Sending...' : 'Send'}
+                    {busy ? 'Sending...' : 'Send'}
                 </button>
             </form>
         </div>

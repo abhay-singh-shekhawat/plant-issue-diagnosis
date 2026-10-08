@@ -1,6 +1,7 @@
 import fs from 'fs';
 import { processMessage } from '../services/agent.service.js';
-import { serializeConversation } from '../services/session.service.js';
+import { serializeConversation, normalizeCoordinates } from '../services/session.service.js';
+import { validateImageUpload } from '../file-validate.js';
 
 // Multer writes the file to disk BEFORE this handler runs, so every early
 // 400 / 500 return must delete the orphan or user_img_web/ grows forever.
@@ -16,14 +17,29 @@ export const handleImageUpload = async (req, res) => {
             return res.status(400).json({ error: 'No image uploaded' });
         }
 
+        // Content validation on the saved bytes — the security boundary.
+        // MIME headers and filename extensions are both attacker-controlled,
+        // so neither is trusted: the magic bytes decide what the file is.
+        const verdict = validateImageUpload(req.file);
+        if (!verdict.ok) {
+            deleteOrphanUpload(req);
+            return res.status(400).json({ error: verdict.error });
+        }
+
         const {
             source,
             coordinates: rawCoordinates,
-            sessionId = 'web_guest_user',
+            sessionId = null,
             action = null,
             caseId = null,
             text = ''
         } = req.body;
+
+        // No shared guest bucket (see message.controller.js).
+        if (typeof sessionId !== 'string' || !sessionId.trim()) {
+            deleteOrphanUpload(req);
+            return res.status(400).json({ error: 'sessionId is required' });
+        }
         let coordinates = null;
 
         // since it might be stringified from multipart/form-data
@@ -33,6 +49,13 @@ export const handleImageUpload = async (req, res) => {
             } catch (e) {
                 deleteOrphanUpload(req);
                 return res.status(400).json({ error: 'Invalid coordinates format' });
+            }
+            // Malformed values (non-numeric, out-of-range) are rejected here so
+            // they can never flow into weather URLs, soil math, or the LLM prompt.
+            coordinates = normalizeCoordinates(coordinates);
+            if (!coordinates) {
+                deleteOrphanUpload(req);
+                return res.status(400).json({ error: 'Invalid coordinates: lat must be -90..90, lon -180..180 (finite numbers)' });
             }
         }
 

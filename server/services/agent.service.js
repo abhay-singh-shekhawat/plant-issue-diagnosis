@@ -3,6 +3,8 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+import { envNum } from '../env.js';
+import { coerceLanguage } from '../language.js';
 import { getWeatherData } from './weather.service.js';
 import { getMockSatelliteData } from './satellite.service.js';
 import { getVisualDiagnosis } from './vision.service.js';
@@ -14,11 +16,42 @@ const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
 
 // Diagnosis is finalised only at/above this score, unless the follow-up budget
-// is exhausted (the anti-infinite-loop breaker).
-const CONFIDENCE_THRESHOLD = Number(process.env.CONFIDENCE_THRESHOLD || 85);
-const MAX_FOLLOW_UP_QUESTIONS = Number(process.env.MAX_FOLLOW_UP_QUESTIONS || 2);
+// is exhausted (the anti-infinite-loop breaker). Validated via envNum: garbage
+// like "abc" falls back to defaults instead of NaN (which broke comparisons).
+const CONFIDENCE_THRESHOLD = envNum('CONFIDENCE_THRESHOLD', 85);
+const MAX_FOLLOW_UP_QUESTIONS = envNum('MAX_FOLLOW_UP_QUESTIONS', 2);
 
 const FALLBACK_FOLLOW_UP = 'कृपया मुझे अपनी समस्या के बारे में और जानकारी दें।';
+
+// --- history helpers ----------------------------------------------------------
+/** Hard cap on stored turns per case. The send window is still last-6; this only
+ *  bounds memory so a long-lived case cannot grow `history` forever. */
+export const MAX_HISTORY_ENTRIES = 50;
+
+/** Pushes one turn and trims the tail so history never exceeds the cap. */
+export const pushHistory = (kase, role, content) => {
+    if (!kase || !Array.isArray(kase.history)) return;
+    kase.history.push({ role, content });
+    if (kase.history.length > MAX_HISTORY_ENTRIES) {
+        kase.history.splice(0, kase.history.length - MAX_HISTORY_ENTRIES);
+    }
+};
+
+/**
+ * Builds the Gemini `contents` array from case history: last 6 turns, starting
+ * on a user turn (the API rejects history starting with a model turn).
+ * Returns `[]` when no user turn exists in the window — the caller must handle
+ * that explicitly instead of dereferencing `contents[-1]`.
+ */
+export const buildChatContents = (history) => {
+    const window = (Array.isArray(history) ? history : []).slice(-6);
+    const firstUserIndex = window.findIndex((m) => m && m.role === 'user');
+    if (firstUserIndex === -1) return [];
+    return window.slice(firstUserIndex).map((msg) => ({
+        role: msg.role === 'model' ? 'model' : 'user',
+        parts: [{ text: msg.content }]
+    }));
+};
 
 let genAIClient = null;
 const getGenAI = () => {
@@ -89,12 +122,19 @@ const processMessageInner = async ({
     const { conversation, photoChanged, isProgression, needsClarification, directResponse } = resolution;
     let kase = resolution.case;
 
-    if (language) conversation.language = language;
+    // Language boundary (R3): raw caller input is NEVER stored verbatim.
+    // Valid → canonical code. Invalid on an existing session → keep the prior
+    // valid language (never clobber, never 400 an established conversation).
+    // Invalid with no prior → DEFAULT_LANGUAGE. This also fixes the crash where
+    // a non-string `language` reached buildGatheringNudge's `.split()`.
+    if (language !== null && language !== undefined && language !== '') {
+        conversation.language = coerceLanguage(language, conversation.language);
+    }
 
     // Deterministic reply (case list / switch ack / "same or new?"): no LLM call needed.
     if (directResponse) {
         const target = kase || getActiveCase(conversation);
-        if (target) target.history.push({ role: 'model', content: directResponse });
+        if (target) pushHistory(target, 'model', directResponse);
         return {
             text: directResponse,
             diagnosticResult: null,
@@ -142,7 +182,7 @@ const processMessageInner = async ({
         // Still gathering slots (no image or no location yet). No need to call
         // Gemini — just tell the farmer exactly what is missing in their language.
         const nudge = buildGatheringNudge(kase, conversation.language || language);
-        kase.history.push({ role: 'model', content: nudge });
+        pushHistory(kase, 'model', nudge);
         kase.updatedAt = Date.now();
         return {
             text: nudge,
@@ -193,18 +233,15 @@ ${systemPromptAddition}
         };
     }
 
-    kase.history.push({ role: 'user', content: inputContent });
+    pushHistory(kase, 'user', inputContent);
 
-    // 5. Bound the history to the last 6 turns AND make sure the window starts
-    //    on a user turn (the Gemini API rejects history starting with a model turn).
-    let historyWindow = kase.history.slice(-6);
-    const firstUserIndex = historyWindow.findIndex((m) => m.role === 'user');
-    historyWindow = firstUserIndex === -1 ? [] : historyWindow.slice(firstUserIndex);
-
-    const contents = historyWindow.map(msg => ({
-        role: msg.role === 'model' ? 'model' : 'user',
-        parts: [{ text: msg.content }]
-    }));
+    // 5. Send window: last 6 turns starting on a user turn. An empty window
+    //    (no user turn — only reachable via synthetic/legacy histories) falls
+    //    back to the current input alone instead of dereferencing contents[-1].
+    let contents = buildChatContents(kase.history);
+    if (contents.length === 0) {
+        contents = [{ role: 'user', parts: [{ text: inputContent }] }];
+    }
 
     const latestUserMsgIndex = contents.length - 1;
 
@@ -265,7 +302,7 @@ ${systemPromptAddition}
         }
 
         // Add to history so the AI remembers the actual question it asked
-        kase.history.push({ role: 'model', content: aiResponseText });
+        pushHistory(kase, 'model', aiResponseText);
         kase.updatedAt = Date.now();
 
         return {
@@ -281,6 +318,10 @@ ${systemPromptAddition}
         // of a generic error. If we already know what they are missing, tell
         // them specifically; otherwise ask for the photo + location.
         console.error('[Agent] processMessage error:', (error && error.message) || error);
+        // Record the failure turn: the transcript must show the farmer's
+        // message AND the fallback reply, like the success path does.
+        pushHistory(kase, 'model', '[turn failed: Gemini/network error — fallback reply sent]');
+        if (kase) kase.updatedAt = Date.now();
         const hasImage = !!(kase && kase.image_url);
         const hasLocation = !!(kase && kase.coordinates);
         let fallback;
@@ -330,7 +371,7 @@ CRITICAL INSTRUCTION: You MUST format your ENTIRE output as a valid JSON object.
 }
 `;
 
-function buildDiagnosisPrompt(kase, conversation) {
+export function buildDiagnosisPrompt(kase, conversation) {
     const d = kase.diagnostic_data;
     return `
 [PHASE 3: CONFIDENCE-BASED DYNAMIC DIAGNOSIS]
@@ -341,10 +382,11 @@ We have collected initial multi-modal data:
 - Visual Cues: ${d.visual_diagnosis.visual_cues}
 - Visual Model Confidence: ${d.visual_diagnosis.confidence}%
 - Alternatives considered: ${(d.visual_diagnosis.differential || []).join('; ') || 'none'}
+- Visual Source: ${d.visual_diagnosis.source || 'unknown'}${d.visual_diagnosis.source === 'fallback' ? ' — NO automated visual analysis was possible; do NOT describe photo details as observed fact' : ''}
 
 --- GEO-SPATIAL DATA ---
-Weather: ${d.geo_spatial_data.weather.temperature_c}°C, Humidity ${d.geo_spatial_data.weather.humidity_percent}%
-Soil Moisture: ${d.geo_spatial_data.soil_satellite_mock.soil_moisture_percent}%
+Weather: ${d.geo_spatial_data.weather.temperature_c}°C, Humidity ${d.geo_spatial_data.weather.humidity_percent}% (source: ${d.geo_spatial_data.weather.source || 'unknown'}${d.geo_spatial_data.weather.source === 'fallback' ? ' — service was down, this is an average-day placeholder, NOT a measurement' : ''})
+Soil Moisture: ${d.geo_spatial_data.soil_satellite_mock.soil_moisture_percent}% (source: ${d.geo_spatial_data.soil_satellite_mock.source || 'estimated'} — formula estimate from weather, NOT satellite-measured; never present as measured data)
 
 This case is labelled: ${kase.label}
 Previous Follow-up Questions Asked by you: ${kase.question_count}
@@ -361,7 +403,7 @@ ${DIAGNOSIS_JSON_CONTRACT}`;
  * Phase 3B — the farmer reported the SAME problem again, later, with a NEW
  * photo. Compare against the previous conclusion instead of re-interviewing.
  */
-function buildProgressionPrompt(kase, conversation) {
+export function buildProgressionPrompt(kase, conversation) {
     const d = kase.diagnostic_data;
     const previous = kase.last_diagnosis || 'No previous conclusion was recorded for this case.';
     return `
@@ -377,8 +419,9 @@ ${previous}
 - Visual Cues: ${d.visual_diagnosis.visual_cues}
 - Visual Model Confidence: ${d.visual_diagnosis.confidence}%
 - Alternatives considered: ${(d.visual_diagnosis.differential || []).join('; ') || 'none'}
-Weather now: ${d.geo_spatial_data.weather.temperature_c}°C, Humidity ${d.geo_spatial_data.weather.humidity_percent}%
-Soil Moisture now: ${d.geo_spatial_data.soil_satellite_mock.soil_moisture_percent}%
+- Visual Source: ${d.visual_diagnosis.source || 'unknown'}${d.visual_diagnosis.source === 'fallback' ? ' — NO automated visual analysis was possible; do NOT describe photo details as observed fact' : ''}
+Weather now: ${d.geo_spatial_data.weather.temperature_c}°C, Humidity ${d.geo_spatial_data.weather.humidity_percent}% (source: ${d.geo_spatial_data.weather.source || 'unknown'}${d.geo_spatial_data.weather.source === 'fallback' ? ' — placeholder, NOT measured' : ''})
+Soil Moisture now: ${d.geo_spatial_data.soil_satellite_mock.soil_moisture_percent}% (source: ${d.geo_spatial_data.soil_satellite_mock.source || 'estimated'} — estimate, NOT measured)
 
 YOUR TASK:
 Decide whether the condition is IMPROVING, STABLE or WORSENING compared with your previous diagnosis, and revise the remedy accordingly (escalate if it is worsening).

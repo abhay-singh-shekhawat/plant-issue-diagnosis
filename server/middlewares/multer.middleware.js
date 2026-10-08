@@ -25,9 +25,18 @@ const storage = multer.diskStorage({
     }
 });
 
+/**
+ * Cheap pre-gate on the client-supplied MIME header. This is NOT the security
+ * boundary — headers are attacker-controlled. The real check is
+ * validateImageUpload() on the saved bytes in the controller (magic bytes +
+ * ext/MIME/signature consistency). This filter only rejects obvious junk early
+ * so multer never writes it to disk.
+ */
+const ALLOWED_UPLOAD_MIMES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
+
 const fileFilter = (req, file, cb) => {
-    // Accept only image files
-    if (file.mimetype && file.mimetype.startsWith('image/')) {
+    const claimed = (file.mimetype || '').split(';')[0].trim().toLowerCase();
+    if (ALLOWED_UPLOAD_MIMES.has(claimed)) {
         cb(null, true);
     } else {
         cb(new Error('Only image files are allowed!'), false);

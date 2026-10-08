@@ -11,6 +11,7 @@ import { startSessionSweeper } from './services/session.service.js';
 import { startTempFileSweeper } from './services/cleanup.service.js';
 import { rateLimit } from './middlewares/rateLimit.middleware.js';
 import { notFound, errorHandler } from './middlewares/error.middleware.js';
+import { envNum } from './env.js';
  
 dotenv.config();
 
@@ -19,6 +20,17 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 4000;
+
+// Trust only an EXPLICIT number of proxy hops for req.ip (rate-limit key).
+// Default 0 = direct client IP (safe for laptop/single-server runs; a shared
+// proxy IP then shares one bucket — fail-closed, never fail-open). Set
+// TRUST_PROXY_HOPS=1 behind one reverse proxy (nginx/Cloudflare) so real client
+// IPs are keyed. Never blanket `trust proxy=true`: that lets any caller spoof
+// X-Forwarded-For and dodge the limiter entirely.
+{
+    const hops = envNum('TRUST_PROXY_HOPS', 0);
+    if (hops > 0) app.set('trust proxy', Math.floor(hops));
+}
 
 // Allowed origins (env-driven, backwards-compatible defaults)
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || 'https://sc.sawinest.xyz,http://localhost:5173')
