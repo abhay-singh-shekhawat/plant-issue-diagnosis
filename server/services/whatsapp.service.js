@@ -512,7 +512,12 @@ export const initializeWhatsAppClient = () => {
             text: msg.body && typeof msg.body === 'string' && !msg.location ? msg.body : '',
             imageUrl: null,
             coordinates: null,
-            language: null
+            language: null,
+            // Platform message id → shared idempotency layer: a retried
+            // WhatsApp delivery of the same event replays the first reply
+            // instead of mutating the case twice. No domain logic lives here —
+            // the id is opaque routing metadata for processMessage().
+            messageId: (msg && msg.id && (msg.id._serialized || msg.id.id)) || null
         };
 
         try {

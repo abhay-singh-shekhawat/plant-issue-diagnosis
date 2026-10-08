@@ -8,8 +8,21 @@ import { coerceLanguage } from '../language.js';
 import { getWeatherData } from './weather.service.js';
 import { getMockSatelliteData } from './satellite.service.js';
 import { getVisualDiagnosis } from './vision.service.js';
-import { resolveTargetCase, getActiveCase, setCaseLabel, withConversationLock } from './session.service.js';
+import { resolveTargetCase, getActiveCase, getConversation, setCaseLabel, withConversationLock } from './session.service.js';
 import { geminiWithRetry } from './gemini-retry.js';
+import { normalizeMessage } from './message.gateway.js';
+import { getCachedReply, markMessageSeen } from './idempotency.service.js';
+import {
+    parsePurchaseMode,
+    setPurchaseMode,
+    ensureSeedContext,
+    AMBIGUOUS_MODE,
+} from './seed/seed-slot.service.js';
+import { runBrandedStep } from './seed/branded-seed.workflow.js';
+import { runOpenStep } from './seed/open-seed.workflow.js';
+import { ensureComplaint } from './seed/complaint.service.js';
+import { ensureReviewTaskForAssessment } from './seed/review.service.js';
+import { getLatestAssessment } from './seed/assessment.service.js';
 
 // Initialize Gemini API (lazy + guarded so the server never crashes on boot)
 const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
@@ -108,16 +121,49 @@ const processMessageInner = async ({
     coordinates = null,
     language = null,
     action = null,
-    caseId = null
+    caseId = null,
+    domain = null,
+    seedHints = [],
+    messageId = null,
+    correlationId = null,
 }) => {
+    // Phase 1 gateway: normalize once; every downstream consumer reads `msg`.
+    const msg = normalizeMessage({
+        sessionId, source, text, imageUrl, coordinates, language,
+        action, caseId, domain, seedHints, messageId, correlationId,
+    });
+    const mark = (reply) => { if (msg.messageId) markMessageSeen(msg.messageId, reply); };
+
+    // Idempotency: a repeated delivery of the same messageId returns the first
+    // accepted reply WITHOUT re-running resolution (no duplicate photo attach,
+    // no duplicate history, no second LLM call).
+    if (msg.messageId) {
+        const cached = getCachedReply(msg.messageId);
+        if (cached) {
+            const conversation = getConversation(msg.sessionId);
+            const target = getActiveCase(msg.sessionId);
+            return {
+                text: cached.text,
+                diagnosticResult: null,
+                state: target,
+                conversation,
+                language: cached.language || conversation.language,
+                needsClarification: cached.needsClarification || null,
+                deduped: true,
+            };
+        }
+    }
+
     // 0. Resolve WHICH case this message belongs to (create / switch / clarify / progress).
     const resolution = resolveTargetCase({
-        conversationId: sessionId,
-        text,
-        imageUrl,
-        coordinates,
-        action,
-        caseId
+        conversationId: msg.sessionId,
+        text: msg.text,
+        imageUrl: msg.imageUrl,
+        coordinates: msg.coordinates,
+        action: msg.action,
+        caseId: msg.caseId,
+        domain: msg.domain,
+        seedHints: msg.seedHints,
     });
     const { conversation, photoChanged, isProgression, needsClarification, directResponse } = resolution;
     let kase = resolution.case;
@@ -127,15 +173,15 @@ const processMessageInner = async ({
     // valid language (never clobber, never 400 an established conversation).
     // Invalid with no prior → DEFAULT_LANGUAGE. This also fixes the crash where
     // a non-string `language` reached buildGatheringNudge's `.split()`.
-    if (language !== null && language !== undefined && language !== '') {
-        conversation.language = coerceLanguage(language, conversation.language);
+    if (msg.language !== null && msg.language !== undefined && msg.language !== '') {
+        conversation.language = coerceLanguage(msg.language, conversation.language);
     }
 
     // Deterministic reply (case list / switch ack / "same or new?"): no LLM call needed.
     if (directResponse) {
         const target = kase || getActiveCase(conversation);
         if (target) pushHistory(target, 'model', directResponse);
-        return {
+        const reply = {
             text: directResponse,
             diagnosticResult: null,
             state: target,
@@ -143,15 +189,99 @@ const processMessageInner = async ({
             language: conversation.language,
             needsClarification
         };
+        mark(reply);
+        return reply;
     }
 
     if (!kase) kase = getActiveCase(conversation);
 
     // 1. Slot filling (a photo was already attached by the resolver)
-    if (coordinates) kase.coordinates = coordinates;
+    if (msg.coordinates) kase.coordinates = msg.coordinates;
 
-    const slotReady = !!(kase.image_url && kase.coordinates);
-    console.log(`[Agent] sessionId=${sessionId} caseId=${kase.caseId} status=${kase.status} hasImage=${!!kase.image_url} hasLocation=${!!kase.coordinates} slotReady=${slotReady} photoChanged=${photoChanged} isProgression=${isProgression}`);
+    // Phase 1 — domain before slot validation (Rule E):
+    // crop keeps photo + location; seed needs photo only, never location.
+    const isSeed = !!kase && typeof kase.caseType === 'string' && kase.caseType.startsWith('SEED');
+    const slotReady = isSeed ? !!kase.image_url : !!(kase.image_url && kase.coordinates);
+    console.log(`[Agent] sessionId=${msg.sessionId} corr=${msg.correlationId} caseId=${kase.caseId} domain=${kase.caseType} status=${kase.status} hasImage=${!!kase.image_url} hasLocation=${!!kase.coordinates} slotReady=${slotReady} photoChanged=${photoChanged} isProgression=${isProgression}`);
+    // Phase 2 — seed branch with purchase-mode state (still NO risk engine).
+    // Deterministic: no weather/soil/Gemini calls, photo-only gate.
+    // UNDECIDED asks, never guesses; explicit cues update the stored mode.
+    if (isSeed) {
+        const userTurn = buildUserTurn({ text: msg.text, imageUrl: msg.imageUrl, coordinates: msg.coordinates });
+        if (userTurn) pushHistory(kase, 'user', userTurn);
+        ensureSeedContext(kase);
+        // Phase 6 — complaint intake: file a record, never a confirmation.
+        // Complaint cases skip purchase-mode parsing entirely.
+        if (kase.caseType === 'SEED_COMPLAINT') {
+            const filed = ensureComplaint({ kase, text: msg.text, imageUrl: msg.imageUrl });
+            const complaintText = buildComplaintReply(filed);
+            pushHistory(kase, 'model', complaintText);
+            kase.updatedAt = Date.now();
+            const reply = {
+                text: complaintText,
+                diagnosticResult: null,
+                state: kase,
+                conversation,
+                language: conversation.language,
+                needsClarification: null
+            };
+            mark(reply);
+            return reply;
+        }
+        const modeBefore = kase.seedContext?.purchaseMode || 'UNDECIDED';
+        let modeNotice = null;
+        if (kase.caseType === 'SEED_VERIFICATION') {
+            const parsed = parsePurchaseMode(msg.text);
+            if (parsed === AMBIGUOUS_MODE) {
+                modeNotice = AMBIGUOUS_MODE;
+            } else if (parsed) {
+                modeNotice = setPurchaseMode(kase, parsed) ? 'updated' : 'confirmed';
+            }
+        }
+        // Phase 3/4: BRANDED and OPEN modes delegate to their packet/seller
+        // workflows (default deps: simulated providers). UNDECIDED,
+        // ambiguous and complaint paths keep their Phase-2 replies.
+        let seedText;
+        const mode = kase.seedContext?.purchaseMode;
+        if (kase.caseType === 'SEED_VERIFICATION' && mode === 'BRANDED' && modeNotice !== AMBIGUOUS_MODE) {
+            const step = await runBrandedStep({
+                kase,
+                text: msg.text,
+                imageUrl: msg.imageUrl,
+                photoChanged,
+                modeBefore,
+            });
+            seedText = step.replyText;
+        } else if (kase.caseType === 'SEED_VERIFICATION' && mode === 'OPEN' && modeNotice !== AMBIGUOUS_MODE) {
+            const step = await runOpenStep({ kase, text: msg.text });
+            seedText = step.replyText;
+        } else {
+            seedText = buildSeedReply(kase, conversation, { modeNotice });
+        }
+        // Phase 6 — a HIGH assessment opens (or reuses) a human-review task.
+        // Deterministic system rule on the approved policy level — the task is
+        // a review request, never an enforcement outcome.
+        if (kase.caseType === 'SEED_VERIFICATION') {
+            const latest = getLatestAssessment(kase.caseId);
+            const flagged = ensureReviewTaskForAssessment(kase, latest);
+            if (flagged && flagged.fresh) {
+                seedText += `\n· Review: human-review task ${flagged.task.reviewId} is open — a reviewer decides, not the app. (समीक्षा खुली है — फैसला मानव समीक्षक करेगा।)`;
+            }
+        }
+        pushHistory(kase, 'model', seedText);
+        kase.updatedAt = Date.now();
+        const reply = {
+            text: seedText,
+            diagnosticResult: null,
+            state: kase,
+            conversation,
+            language: conversation.language,
+            needsClarification: null
+        };
+        mark(reply);
+        return reply;
+    }
+
     let systemPromptAddition = '';
     let isConfidenceEval = false;
 
@@ -181,10 +311,10 @@ const processMessageInner = async ({
     } else {
         // Still gathering slots (no image or no location yet). No need to call
         // Gemini — just tell the farmer exactly what is missing in their language.
-        const nudge = buildGatheringNudge(kase, conversation.language || language);
+        const nudge = buildGatheringNudge(kase, conversation.language || msg.language);
         pushHistory(kase, 'model', nudge);
         kase.updatedAt = Date.now();
-        return {
+        const gatheringReply = {
             text: nudge,
             diagnosticResult: null,
             state: kase,
@@ -192,6 +322,8 @@ const processMessageInner = async ({
             language: conversation.language,
             needsClarification: null
         };
+        mark(gatheringReply);
+        return gatheringReply;
     }
 
     // 3. Assemble the system instruction. It is passed to Gemini natively
@@ -201,7 +333,7 @@ const processMessageInner = async ({
     // LANGUAGE RULE — baked in explicitly so Gemini never has to guess.
     // conversation.language is set from Deepgram STT detection or the user's
     // typed text on every turn, so it always reflects the farmer's actual language.
-    const detectedLang = conversation.language || language || 'hi';
+    const detectedLang = conversation.language || msg.language || 'hi';
     const langInstruction = `
 CRITICAL LANGUAGE RULE: You MUST reply ONLY in this language code: "${detectedLang}".
 Do NOT use any other language. Do NOT mix languages. Do NOT use Japanese, Chinese, Korean or any script the farmer did not use.
@@ -218,19 +350,21 @@ ${systemPromptAddition}
 `;
 
     // 4. Add the user's turn to THIS case's short-term memory.
-    const inputContent = buildUserTurn({ text, imageUrl, coordinates });
+    const inputContent = buildUserTurn({ text: msg.text, imageUrl: msg.imageUrl, coordinates: msg.coordinates });
 
     if (!inputContent) {
         // Empty message (sticker, blank forward) — don't call the AI, just nudge.
         const target = kase || getActiveCase(conversation);
-        return {
-            text: buildGatheringPromptNudge(target, conversation.language || language),
+        const emptyReply = {
+            text: buildGatheringPromptNudge(target, conversation.language || msg.language),
             diagnosticResult: null,
             state: target,
             conversation,
             language: conversation.language,
             needsClarification: null
         };
+        mark(emptyReply);
+        return emptyReply;
     }
 
     pushHistory(kase, 'user', inputContent);
@@ -305,7 +439,7 @@ ${systemPromptAddition}
         pushHistory(kase, 'model', aiResponseText);
         kase.updatedAt = Date.now();
 
-        return {
+        const doneReply = {
             text: aiResponseText,
             diagnosticResult: isFinalDiag ? kase.diagnostic_data : null,
             state: kase,
@@ -313,6 +447,8 @@ ${systemPromptAddition}
             language: conversation.language,
             needsClarification: null
         };
+        mark(doneReply);
+        return doneReply;
     } catch (error) {
         // Network / API failure — give the farmer actionable guidance instead
         // of a generic error. If we already know what they are missing, tell
@@ -322,10 +458,14 @@ ${systemPromptAddition}
         // message AND the fallback reply, like the success path does.
         pushHistory(kase, 'model', '[turn failed: Gemini/network error — fallback reply sent]');
         if (kase) kase.updatedAt = Date.now();
+        const seedFailed = !!kase && typeof kase.caseType === 'string' && kase.caseType.startsWith('SEED');
         const hasImage = !!(kase && kase.image_url);
         const hasLocation = !!(kase && kase.coordinates);
         let fallback;
-        if (!hasImage && !hasLocation) {
+        if (seedFailed && !hasImage) {
+            // Seed needs a photo, never a location — do not ask for a pin here.
+            fallback = 'बीज की एक साफ फोटो भेजें (बीज या पैकेट की)। बीज जांच के लिए लोकेशन जरूरी नहीं है।\nPlease send a clear photo of the seed or packet. No location is needed for seed verification.';
+        } else if (!hasImage && !hasLocation) {
             fallback = 'नमस्ते! 🌱 कृपया अपनी फसल की एक साफ फोटो और अपनी लोकेशन पिन भेजें — फिर मैं आपकी फसल की बीमारी पहचानकर उपाय बताऊंगा।\n\nHello! Please send a clear photo of your crop and share your location pin 📍 — I will then diagnose the problem and suggest a remedy in your language.';
         } else if (!hasImage) {
             fallback = 'कृपया प्रभावित फसल की एक साफ फोटो भेजें। / Please send a clear photo of the affected crop.';
@@ -334,7 +474,7 @@ ${systemPromptAddition}
         } else {
             fallback = 'कुछ तकनीकी समस्या आई। कृपया थोड़ी देर बाद दोबारा भेजें। / A technical issue occurred. Please try sending again in a moment.';
         }
-        return {
+        const fallbackReply = {
             text: fallback,
             diagnosticResult: null,
             state: kase,
@@ -342,6 +482,8 @@ ${systemPromptAddition}
             language: conversation.language,
             needsClarification: null
         };
+        mark(fallbackReply);
+        return fallbackReply;
     }
 };
 
@@ -463,6 +605,108 @@ function buildUserTurn({ text, imageUrl, coordinates }) {
 /** Localized nudge used when a message carried no interpretable content. */
 function buildGatheringPromptNudge(kase, lang) {
     return buildGatheringNudge(kase, lang);
+}
+
+/**
+ * Phase 6 complaint reply — confirms RECORDING, never confirmation.
+ * Deterministic, no AI, no verdict. Tells the farmer what happens next
+ * (human review) and what details still help (seller/brand/lot/problem).
+ */
+function buildComplaintReply(filed) {
+    if (!filed) {
+        return [
+            'शिकायत समझ नहीं आई — कृपया विक्रेता/दुकान, ब्रांड/किस्म और समस्या लिखें।',
+            '',
+            'Complaint not understood — please write the seller/shop, brand/variety and the problem faced.',
+        ].join('\n');
+    }
+    const { record, isNew } = filed;
+    const head = isNew
+        ? [
+            `शिकायत दर्ज हो गई (complaint recorded, ID: ${record.complaintId})।`,
+            'यह सिर्फ रिकॉर्ड है — कोई फैसला नहीं हुआ है, किसी पर आरोप तय नहीं हुआ।',
+        ]
+        : [
+            `आपकी शिकायत ${record.complaintId} में नई जानकारी जोड़ी गई।`,
+            'यह सिर्फ रिकॉर्ड है — कोई फैसला नहीं हुआ है।',
+        ];
+    return [
+        ...head,
+        'मानव समीक्षक जांच करेगा। कृपया बताएं: विक्रेता/दुकान का नाम, ब्रांड/किस्म/लॉट और क्या समस्या आई?',
+        '',
+        isNew
+            ? `Complaint recorded (ID: ${record.complaintId}). This is only a record — nothing is confirmed, no one is accused.`
+            : `Added to your complaint ${record.complaintId}. This is only a record — nothing is confirmed.`,
+        'A human reviewer will examine it. Please share: seller/shop name, brand/variety/lot, and the problem faced.',
+    ].join('\n');
+}
+
+/**
+ * Phase 2 seed reply — deterministic, no AI, no authenticity claim.
+ * Photo missing → ask for the photo (never for location).
+ * Photo present → confirm receipt (location explicitly not needed) and either
+ * ask the branded-vs-open question (UNDECIDED) or confirm the stored mode and
+ * name the next collection step (packet details / seller+price details).
+ * Complaint cases get a complaint-shaped variant of the same safe step.
+ */
+function buildSeedReply(kase, conversation, { modeNotice = null } = {}) {
+    const hasImage = !!(kase && kase.image_url);
+    const isComplaint = kase && kase.caseType === 'SEED_COMPLAINT';
+    if (!hasImage) {
+        return [
+            'बीज जांच के लिए बीज या पैकेट की एक साफ फोटो भेजें। 📷',
+            'बीज जांच के लिए लोकेशन जरूरी नहीं है।',
+            '',
+            'Please send a clear photo of the seed or seed packet. 📷',
+            'No location is needed for seed verification.'
+        ].join('\n');
+    }
+    if (isComplaint) {
+        return [
+            'आपकी बीज शिकायत की फोटो मिल गई। लोकेशन की जरूरत नहीं है।',
+            'कृपया बताएं: विक्रेता/दुकान का नाम, ब्रांड/किस्म, और क्या समस्या आई?',
+            '',
+            'Your seed complaint photo is received. No location is needed.',
+            'Please share: seller/shop name, brand/variety, and what problem you faced?'
+        ].join('\n');
+    }
+    if (modeNotice === AMBIGUOUS_MODE) {
+        return [
+            'समझ नहीं आया — क्या यह ब्रांडेड/पैकेट वाला बीज है या खुला बीज?',
+            'सिर्फ एक जवाब दें: *branded* या *open*',
+            '',
+            'Not sure I understood — is this a branded/packaged seed or an open/loose seed?',
+            'Reply with just one word: *branded* or *open*'
+        ].join('\n');
+    }
+    const mode = kase?.seedContext?.purchaseMode || 'UNDECIDED';
+    if (mode === 'BRANDED') {
+        return [
+            'ब्रांडेड/पैकेट वाला बीज नोट किया (type: branded seed)। लोकेशन की जरूरत नहीं है। 🌱',
+            'अगला कदम: पैकेट की साफ फोटो हो तो भेजें — फिर ब्रांड, किस्म, लॉट/बैच और MRP जैसी दिख रही जानकारी पूछूंगा।',
+            '',
+            'Branded/packaged seed noted (type: branded seed). No location is needed. 🌱',
+            'Next step: if you have it, send a clear photo of the packet — then I will ask for the visible details (brand, variety, lot/batch, MRP).'
+        ].join('\n');
+    }
+    if (mode === 'OPEN') {
+        return [
+            'खुला बीज नोट किया (type: open seed)। लोकेशन की जरूरत नहीं है। 🌱',
+            'अगला कदम: विक्रेता/दुकान का नाम और भाव (price) बताएं — फिर उपलब्ध जानकारी से मिलान करूंगा।',
+            '',
+            'Open/loose seed noted (type: open seed). No location is needed. 🌱',
+            'Next step: share the seller/shop name and the price — then I will compare with whatever reference information is available.'
+        ].join('\n');
+    }
+    return [
+        'बीज की फोटो मिल गई। बीज जांच के लिए लोकेशन जरूरी नहीं है। 🌱',
+        'क्या यह ब्रांडेड/पैकेट वाला बीज है या खुला बीज?',
+        'जवाब दें: *branded* या *open*',
+        '',
+        'Seed photo received. No location is needed for seed verification. 🌱',
+        'Is this a branded/packaged seed or open/loose seed?',
+        'Reply: *branded* or *open*'
+    ].join('\n');
 }
 
 /**

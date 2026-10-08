@@ -14,7 +14,10 @@ export const handleChatMessage = async (req, res) => {
             text = '',
             action = null,
             caseId = null,
-            language = null
+            language = null,
+            domain = null,
+            messageId = null,
+            seedHints = []
         } = req.body || {};
 
         // No shared guest bucket: every caller must identify its own session.
@@ -29,7 +32,10 @@ export const handleChatMessage = async (req, res) => {
             text: typeof text === 'string' ? text.slice(0, 2000) : '',
             action,
             caseId,
-            language
+            language,
+            domain: typeof domain === 'string' && domain.trim() ? domain : null,
+            messageId: typeof messageId === 'string' && messageId.trim() ? messageId : null,
+            seedHints: Array.isArray(seedHints) ? seedHints : []
         });
 
         res.status(200).json({

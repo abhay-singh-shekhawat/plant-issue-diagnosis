@@ -32,7 +32,10 @@ export const handleImageUpload = async (req, res) => {
             sessionId = null,
             action = null,
             caseId = null,
-            text = ''
+            text = '',
+            domain = null,
+            messageId = null,
+            language = null
         } = req.body;
 
         // No shared guest bucket (see message.controller.js).
@@ -67,7 +70,10 @@ export const handleImageUpload = async (req, res) => {
             has_coordinates: !!coordinates
         }));
 
-        // Run the agent process for the Web user
+        // Run the agent process for the Web user.
+        // Optional channel fields (all backward-compatible null defaults):
+        // `domain` lets the Web UI open a seed case explicitly, `messageId`
+        // enables duplicate-delivery dedupe, `language` seeds the reply voice.
         const aiResult = await processMessage({
             sessionId: sessionId,
             source: source || 'web',
@@ -75,8 +81,17 @@ export const handleImageUpload = async (req, res) => {
             imageUrl: fileUrl,
             coordinates: coordinates,
             action: action || null,
-            caseId: caseId || null
+            caseId: caseId || null,
+            domain: typeof domain === 'string' && domain.trim() ? domain : null,
+            messageId: typeof messageId === 'string' && messageId.trim() ? messageId : null,
+            language: typeof language === 'string' && language.trim() ? language : null
         });
+
+        // Deduplicated delivery (same messageId retried): no case references
+        // this file, so remove it now instead of waiting for the hourly sweep.
+        if (aiResult.deduped) {
+            deleteOrphanUpload(req);
+        }
 
         // Creating response mimicking chat payload behavior (including the AI's intelligent text)
         const responsePayload = {
