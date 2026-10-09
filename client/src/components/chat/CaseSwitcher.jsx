@@ -1,9 +1,12 @@
 import React from 'react';
+import { Plus } from 'lucide-react';
+import StatusDot from '../ui/StatusDot';
 
-const STATUS_DOT = {
-  completed: 'bg-green-400',
-  evaluating_confidence: 'bg-amber-400',
-  gathering_info: 'bg-gray-400'
+// Maps case status to the StatusDot palette (dot never renders alone).
+const STATUS_KEY = {
+  completed: 'completed',
+  evaluating_confidence: 'evaluating',
+  gathering_info: 'gathering'
 };
 
 /**
@@ -15,26 +18,28 @@ const CaseSwitcher = ({ conversation, busy = false, onSelectCase, onNewCase }) =
   if (cases.length === 0) return null;
 
   return (
-    <div className="px-4 py-2 bg-gray-50 border-t border-gray-200 flex items-center gap-2 overflow-x-auto shrink-0">
-      <span className="text-xs font-medium text-gray-500 shrink-0">Cases:</span>
+    <div className="py-2 border-b border-line flex items-center gap-2 overflow-x-auto shrink-0" role="tablist" aria-label="Cases">
+      <span className="text-xs font-medium text-muted shrink-0 font-mono-sc uppercase tracking-[0.14em]">Cases</span>
 
       {cases.map((c, index) => {
         const isActive = c.caseId === conversation.activeCaseId;
         return (
           <button
             key={c.caseId}
+            role="tab"
+            aria-selected={isActive}
             onClick={() => onSelectCase(c.caseId)}
             disabled={busy}
             title={`${c.label} (${c.status})`}
-            className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs whitespace-nowrap border transition-colors disabled:opacity-50 disabled:cursor-wait ${
+            className={`flex items-center gap-1.5 px-3 py-1 min-h-[44px] rounded-full text-xs whitespace-nowrap border transition-colors disabled:opacity-50 disabled:cursor-wait active:scale-[0.98] ${
               isActive
-                ? 'bg-blue-600 text-white border-blue-600'
-                : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-100'
+                ? 'bg-accent text-accent-ink border-accent'
+                : 'bg-surface text-ink border-line hover:bg-mist'
             }`}
           >
-            <span className="font-semibold">{index + 1}</span>
+            <span className="font-semibold font-mono-sc">{index + 1}</span>
             <span className="max-w-[140px] truncate">{c.label}</span>
-            <span className={`w-1.5 h-1.5 rounded-full ${STATUS_DOT[c.status] || 'bg-gray-400'}`} />
+            <StatusDot status={STATUS_KEY[c.status] || 'gathering'} label="" />
           </button>
         );
       })}
@@ -42,9 +47,10 @@ const CaseSwitcher = ({ conversation, busy = false, onSelectCase, onNewCase }) =
       <button
         onClick={onNewCase}
         disabled={busy}
-        className="ml-auto shrink-0 px-3 py-1 rounded-full text-xs border border-blue-600 text-blue-600 hover:bg-blue-50 whitespace-nowrap disabled:opacity-50 disabled:cursor-wait"
+        className="ml-auto shrink-0 inline-flex items-center gap-1 px-3 py-1 min-h-[44px] rounded-full text-xs border border-accent text-accent hover:bg-mist whitespace-nowrap disabled:opacity-50 disabled:cursor-wait active:scale-[0.98]"
       >
-        + New problem
+        <Plus size={14} strokeWidth={1.5} aria-hidden="true" />
+        New problem
       </button>
     </div>
   );

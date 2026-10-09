@@ -1,4 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
+import { Camera, Send, X } from 'lucide-react';
+import VoiceButton from '../voice/VoiceButton';
+import useLocalRecorder from '../voice/useLocalRecorder';
 
 const ChatInput = ({ onSendMessage, onSendText, disabled }) => {
     const [image, setImage] = useState(null);
@@ -12,6 +15,9 @@ const ChatInput = ({ onSendMessage, onSendText, disabled }) => {
     const [sendingImage, setSendingImage] = useState(false);
     const fileInputRef = useRef(null);
     const isSendingRef = useRef(false);
+    // M4 shared voice affordance: local recording only, never uploaded.
+    // Same input serves crop + seed workspaces; location/photo rules unchanged.
+    const recorder = useLocalRecorder();
 
     // Free the previous blob URL whenever the preview changes / unmounts —
     // otherwise every picked photo leaks blob memory for the tab lifetime.
@@ -205,24 +211,41 @@ const ChatInput = ({ onSendMessage, onSendText, disabled }) => {
         }
     };
 
+    // M4 voice takeover: while recording/requesting/previewing, the composer
+    // row is replaced by the full-width voice panel so nothing wraps on 390px.
+    const voiceActive =
+      recorder.status === 'recording' ||
+      recorder.status === 'requesting' ||
+      (recorder.status === 'preview' && recorder.audioUrl);
+
+    // Acceptance fix: denied/unsupported are terminal states that never enter
+    // the takeover panel, so their fallback must render as a visible line
+    // under the composer. The text/photo form stays mounted and usable.
+    const voiceBlocked =
+      recorder.status === 'denied' || recorder.status === 'unsupported';
+
     return (
-        <div className="p-4 bg-white border-t border-gray-200 sticky bottom-0">
+        <div className="py-3">
             {fileError && (
-                <div className="mb-2 text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+                <div role="alert" className="mb-2 text-xs text-danger bg-dangerwash border border-line rounded-input px-3 py-2">
                     {fileError}
                 </div>
             )}
             {previewUrl && (
-                <div className="mb-4 relative inline-block">
-                    <img src={previewUrl} alt="Preview" className="h-32 rounded-lg object-cover border border-gray-300" />
+                <div className="mb-3 relative inline-block">
+                    <img src={previewUrl} alt="Preview" className="h-32 rounded-input object-cover border border-line" />
                     <button
                         onClick={resetInput}
-                        className="absolute -top-2 -right-2 bg-red-500 text-white rounded-full w-6 h-6 flex items-center justify-center hover:bg-red-600"
+                        aria-label="Remove photo"
+                        className="absolute -top-2 -right-2 bg-danger text-white rounded-full w-6 h-6 flex items-center justify-center hover:brightness-110 active:scale-[0.98]"
                     >
-                        ×
+                        <X size={14} strokeWidth={2} aria-hidden="true" />
                     </button>
                 </div>
             )}
+            {voiceActive ? (
+                <VoiceButton recorder={recorder} disabled={busy} />
+            ) : (
             <form onSubmit={guardedSend} className="flex items-center gap-2">
                 <input
                     type="file"
@@ -231,35 +254,47 @@ const ChatInput = ({ onSendMessage, onSendText, disabled }) => {
                     onChange={handleFileChange}
                     className="hidden"
                     id="file-upload"
+                    aria-label="Attach crop photo"
                 />
                 <label
                     htmlFor="file-upload"
-                    className="cursor-pointer p-2 text-gray-500 hover:text-blue-500 hover:bg-blue-50 rounded-full transition-colors"
+                    className="cursor-pointer p-2 min-w-[44px] min-h-[44px] flex items-center justify-center shrink-0 text-muted hover:text-accent hover:bg-mist rounded-full transition-colors"
                     title="Attach Image"
                 >
-                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-6 h-6">
-                        <path strokeLinecap="round" strokeLinejoin="round" d="m2.25 15.75 5.159-5.159a2.25 2.25 0 0 1 3.182 0l5.159 5.159m-1.5-1.5 1.409-1.409a2.25 2.25 0 0 1 3.182 0l2.909 2.909m-18 3.75h16.5a1.5 1.5 0 0 0 1.5-1.5V6a1.5 1.5 0 0 0-1.5-1.5H3.75A1.5 1.5 0 0 0 2.25 6v12a1.5 1.5 0 0 0 1.5 1.5Zm10.5-11.25h.008v.008h-.008V8.25Zm.375 0a.375.375 0 1 1-.75 0 .375.375 0 0 1 .75 0Z" />
-                    </svg>
+                    <Camera size={22} strokeWidth={1.5} aria-hidden="true" />
                 </label>
 
+                <label htmlFor="chat-draft" className="sr-only">Message</label>
                 <input
+                    id="chat-draft"
                     type="text"
                     value={draft}
                     onChange={(e) => setDraft(e.target.value)}
                     onKeyDown={handleTextKeyDown}
-                    placeholder={image ? 'Add a note (optional)…' : 'Type your answer or describe the problem…'}
+                    placeholder={image ? 'Add a note…' : 'Type your answer…'}
                     disabled={busy}
-                    className="flex-1 min-w-0 px-3 py-2 rounded-full border border-gray-300 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
+                    className="flex-1 min-w-0 px-4 py-2 min-h-[44px] rounded-full border border-line bg-surface text-ink text-sm placeholder:text-muted focus:outline-none focus:ring-2 focus:ring-accent disabled:bg-mist disabled:text-muted"
                 />
+
+                {/* M4 shared voice affordance: inline mic, local recording only. */}
+                <VoiceButton recorder={recorder} disabled={busy} inlineMic />
 
                 <button
                     type="submit"
+                    aria-label={busy ? 'Sending' : 'Send message'}
                     disabled={(image ? false : !draft.trim()) || busy}
-                    className={`px-4 py-2 rounded-full font-medium ${(image ? false : !draft.trim()) || busy ? 'bg-gray-300 text-gray-500 cursor-not-allowed' : 'bg-blue-600 text-white hover:bg-blue-700'}`}
+                    className={`inline-flex items-center gap-1.5 px-4 py-2 min-h-[44px] rounded-full text-sm font-medium shrink-0 active:scale-[0.98] ${(image ? false : !draft.trim()) || busy ? 'bg-mist text-muted cursor-not-allowed' : 'bg-accent text-accent-ink hover:brightness-110'}`}
                 >
+                    <Send size={15} strokeWidth={1.75} aria-hidden="true" />
                     {busy ? 'Sending...' : 'Send'}
                 </button>
             </form>
+            )}
+            {voiceBlocked && recorder.error && (
+                <p role="alert" className="mt-2 text-xs text-danger bg-dangerwash border border-line rounded-input px-3 py-2">
+                    {recorder.error}
+                </p>
+            )}
         </div>
     );
 };

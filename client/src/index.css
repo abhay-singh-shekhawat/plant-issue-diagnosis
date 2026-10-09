@@ -1,3 +1,81 @@
+@import '@fontsource/space-grotesk/500.css';
+@import '@fontsource/space-grotesk/600.css';
+@import '@fontsource/space-grotesk/700.css';
+@import '@fontsource/mukta/400.css';
+@import '@fontsource/mukta/500.css';
+@import '@fontsource/mukta/600.css';
+@import '@fontsource/mukta/700.css';
+@import '@fontsource/ibm-plex-mono/400.css';
+@import '@fontsource/ibm-plex-mono/500.css';
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+:root {
+  --sc-paper: #FAF7F0;
+  --sc-surface: #FFFFFF;
+  --sc-ink: #1D211B;
+  --sc-muted: #5C665C;
+  --sc-line: #E3DED2;
+  --sc-accent: #245C3A;
+  --sc-accent-ink: #FFFFFF;
+  --sc-warn: #8A5A1E;
+  --sc-danger: #A83A2E;
+  --sc-mist: #EFF0E8;
+  --sc-warnwash: #FBF0D9;
+  --sc-dangerwash: #FBEAE7;
+}
+
+.dark {
+  --sc-paper: #141712;
+  --sc-surface: #1C201A;
+  --sc-ink: #EDEEE6;
+  --sc-muted: #A7AE9F;
+  --sc-line: #2C322A;
+  --sc-accent: #5FAE77;
+  --sc-accent-ink: #0C120D;
+  --sc-mist: #232820;
+}
+
+html {
+  background: var(--sc-paper);
+}
+
+body {
+  background: var(--sc-paper);
+  color: var(--sc-ink);
+  font-family: "Mukta", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.font-display {
+  font-family: "Space Grotesk", "Mukta", system-ui, sans-serif;
+  letter-spacing: -0.01em;
+}
+
+.font-mono-sc {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+}
+
+/* Visible focus everywhere. Never remove without replacement. */
+:where(a, button, input, [tabindex]):focus-visible {
+  outline: 2px solid var(--sc-accent);
+  outline-offset: 2px;
+}
+
+/* Reduced motion: foundation collapses animation to instant. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Reduced transparency: solid fills, no blur dependency. */
+@media (prefers-reduced-transparency: reduce) {
+  .sc-glass-fallback {
+    backdrop-filter: none !important;
+    background: var(--sc-surface) !important;
+  }
+}
